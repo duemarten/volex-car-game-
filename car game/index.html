@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voxel Car — Open in Chrome</title>
+  <style>
+    html,body{height:100%;margin:0;overflow:hidden;background:#111}
+    #ui{position:fixed;left:12px;top:12px;color:#fff;font-family:Arial,Helvetica,sans-serif;z-index:10}
+    #ui .speed{font-size:18px;margin-bottom:8px}
+    #ui .help{opacity:0.9;font-size:13px;line-height:1.5}
+    canvas{display:block}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="speed">Speed: <span id="speed">0</span></div>
+    <div class="help">W/S accelerate/brake • A/D steer • Space handbrake • Click remove block • Shift+Click place block</div>
+  </div>
+
+  <script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+  <script>
+    // Single-file, file:// friendly car demo using THREE (no external physics engine).
+    // Uses an arcade-style vehicle simulation (suspension-like forces, traction, steering) and
+    // procedural Perlin noise terrain. This runs by opening index.html in Chrome.
+
+    /* --- Small Perlin Noise implementation (public domain-ish) --- */
+    // Permutation table
+    const PERM = (function(){
+      const p = new Uint8Array(512);
+      const perm = [151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127, 4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180];
+      for(let i=0;i<512;i++) p[i]=perm[i&255];
+      return p;
+    })();
+
+    function fade(t){ return t*t*t*(t*(t*6-15)+10); }
+    function lerp(a,b,t){ return a + t*(b-a); }
+    function grad(hash, x, y){ const h = hash & 3; const u = h<2 ? x : y; const v = h<2 ? y : x; return ((h&1)?-u:u) + ((h&2)?-2*v:2*v); }
+    function perlin2(x,y){
+      const xi = Math.floor(x) & 255;
+      const yi = Math.floor(y) & 255;
+      const xf = x - Math.floor(x);
+      const yf = y - Math.floor(y);
+      const u = fade(xf);
+      const v = fade(yf);
+      const aa = PERM[PERM[xi] + yi];
+      const ab = PERM[PERM[xi] + yi + 1];
+      const ba = PERM[PERM[xi + 1] + yi];
+      const bb = PERM[PERM[xi + 1] + yi + 1];
+      const x1 = lerp(grad(aa, xf, yf), grad(ba, xf-1, yf), u);
+      const x2 = lerp(grad(ab, xf, yf-1), grad(bb, xf-1, yf-1), u);
+      return lerp(x1,x2,v);
+    }
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x87b0d6, 0.0025);
+    const camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 2000);
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(innerWidth, innerHeight); renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.shadowMap.enabled = true; document.body.appendChild(renderer.domElement);
+    window.addEventListener('resize', ()=>{ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.7); scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0); dir.position.set(-50,100,-50); dir.castShadow=true; dir.shadow.camera.left=-200; dir.shadow.camera.right=200; dir.shadow.camera.top=200; dir.shadow.camera.bottom=-200; scene.add(dir);
+
+    // Terrain parameters
+    const SIZE = 512; // world units
+    const RES = 128; // grid resolution
+    const half = SIZE/2;
+
+    // build height data
+    const heights = new Float32Array(RES*RES);
+    for(let i=0;i<RES;i++){
+      for(let j=0;j<RES;j++){
+        const nx = i/RES*3.0; const nz = j/RES*3.0;
+        const e = perlin2(nx*0.9, nz*0.9)*20 + perlin2(nx*2.5, nz*2.5)*6 + perlin2(nx*6.0, nz*6.0)*1.5;
+        heights[i*RES + j] = e;
+      }
+    }
+
+    // carve road ring
+    const roadR = SIZE*0.28; const roadW = 6;
+    for(let i=0;i<RES;i++){ for(let j=0;j<RES;j++){ const x = (i/RES)*SIZE - half; const z = (j/RES)*SIZE - half; const d=Math.hypot(x,z); const dist=Math.abs(d-roadR); if(dist<roadW){ const t=1-(dist/roadW); heights[i*RES+j] = lerp(heights[i*RES+j], -1.2, t*t*(3-2*t)); } } }
+
+    // create terrain mesh
+    const geom = new THREE.PlaneGeometry(SIZE, SIZE, RES-1, RES-1); geom.rotateX(-Math.PI/2);
+    const pos = geom.attributes.position;
+    for(let idx=0; idx<pos.count; idx++){ const x = pos.getX(idx), z = pos.getZ(idx); const gx = Math.floor((x+half)/SIZE*(RES-1)); const gz = Math.floor((z+half)/SIZE*(RES-1)); pos.setY(idx, heights[gx*RES + gz]); }
+    geom.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({color:0x88b45a, roughness:0.9, metalness:0.0});
+    const terrain = new THREE.Mesh(geom, mat); terrain.receiveShadow=true; scene.add(terrain);
+
+    // simple asphalt ring
+    const roadMat = new THREE.MeshStandardMaterial({color:0x333333, roughness:0.9});
+    const roadGeo = new THREE.RingGeometry(roadR-roadW/2, roadR+roadW/2, 256);
+    const road = new THREE.Mesh(roadGeo, roadMat); road.rotation.x = -Math.PI/2; road.position.y = -0.3; road.receiveShadow=true; scene.add(road);
+
+    // sky gradient (large sphere)
+    const skyGeo = new THREE.SphereGeometry(900, 16, 8); const skyMat = new THREE.MeshBasicMaterial({color:0x7fbfff, side:THREE.BackSide}); const sky = new THREE.Mesh(skyGeo, skyMat); scene.add(sky);
+
+    // Car model (simple)
+    const car = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2,0.7,4), new THREE.MeshStandardMaterial({color:0xff3333, metalness:0.2, roughness:0.4})); body.castShadow=true; body.position.y=0.6; car.add(body);
+    const wheelGeo = new THREE.CylinderGeometry(0.35,0.35,0.6,12); wheelGeo.rotateZ(Math.PI/2);
+    const wheelMat = new THREE.MeshStandardMaterial({color:0x111111});
+    const wheels = [];
+    const wheelOffsets = [[0.9, -0.6, 1.4], [-0.9, -0.6, 1.4], [0.9, -0.6, -1.4], [-0.9, -0.6, -1.4]];
+    for(let i=0;i<4;i++){ const w = new THREE.Mesh(wheelGeo, wheelMat); w.castShadow=true; w.position.set(wheelOffsets[i][0], wheelOffsets[i][1], wheelOffsets[i][2]); car.add(w); wheels.push(w); }
+    // place car on the road (will be adjusted to terrain height)
+    scene.add(car);
+
+    // Physics state (arcade)
+    const state = { pos: new THREE.Vector3(), vel: new THREE.Vector3(0,0,0), rotY: 0, angVel:0 };
+
+    // spawn car helper: place at ring angle (radians), align tangent, and reset velocity
+    function spawnCarAt(angleRad){
+      const x = Math.cos(angleRad) * roadR;
+      const z = Math.sin(angleRad) * roadR;
+      const y = sampleHeight(x,z) + 0.8;
+      state.pos.set(x, y + 0.2, z);
+      state.vel.set(0,0,0);
+      // tangent vector (direction of increasing angle)
+      const tangent = new THREE.Vector3(-Math.sin(angleRad), 0, Math.cos(angleRad));
+      state.rotY = Math.atan2(tangent.x, tangent.z);
+      // apply to visual car immediately
+      car.position.copy(state.pos);
+      car.rotation.y = state.rotY;
+    }
+
+    // initial spawn at angle 90deg (on the ring near Z positive)
+    spawnCarAt(Math.PI/2);
+    const params = { mass: 1200, engineForce: 4000, brakeForce: 8000, steerSpeed: 2.5, maxSteer: 0.6, suspensionRest: 0.6, suspensionStiff: 2500, gravity: -40, friction: 6 };
+
+    // Controls
+    const keys = { w:false, s:false, a:false, d:false, space:false };
+    window.addEventListener('keydown', e=>{ const k=e.key.toLowerCase(); if(k in keys) keys[k]=true; });
+    window.addEventListener('keyup', e=>{ const k=e.key.toLowerCase(); if(k in keys) keys[k]=false; });
+
+    // UI
+    const ui = document.getElementById('ui'); ui.style.right='12px'; ui.style.left=''; ui.innerHTML = `<div class="speed">Speed: <span id="speed">0</span> km/h</div><div style="margin-top:6px;"><button id="launchBtn">Launch</button> <button id="respawnBtn">Respawn on Road</button></div><div class="help">W/S accelerate • A/D steer • Space handbrake • L launch</div>`;
+    const speedText = document.getElementById('speed');
+    document.getElementById('launchBtn').addEventListener('click', ()=>{
+      // give an impulse in the forward/tangent direction
+      const forward = new THREE.Vector3(Math.sin(state.rotY),0,Math.cos(state.rotY)).normalize();
+      state.vel.add(forward.multiplyScalar(18));
+    });
+    document.getElementById('respawnBtn').addEventListener('click', ()=>{ spawnCarAt(Math.PI/2); });
+    // keyboard shortcut L to launch and R to respawn
+    window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='l'){ const forward = new THREE.Vector3(Math.sin(state.rotY),0,Math.cos(state.rotY)).normalize(); state.vel.add(forward.multiplyScalar(18)); } if(e.key.toLowerCase()==='r'){ spawnCarAt(Math.PI/2); } });
+
+    // helpers: sample height and normal from height grid
+    function sampleHeight(x,z){ // world coords
+      const fx = (x+half)/SIZE*(RES-1); const fz = (z+half)/SIZE*(RES-1);
+      const ix = Math.floor(fx), iz = Math.floor(fz);
+      const sx = fx - ix, sz = fz - iz;
+      const i00 = Math.max(0,Math.min(RES-1, ix)); const j00 = Math.max(0,Math.min(RES-1, iz));
+      const a = heights[i00*RES + j00];
+      const a1 = heights[Math.max(0,Math.min(RES-1, (ix+1)))*RES + j00];
+      const a2 = heights[i00*RES + Math.max(0,Math.min(RES-1, iz+1))];
+      const a3 = heights[Math.max(0,Math.min(RES-1, ix+1))*RES + Math.max(0,Math.min(RES-1, iz+1))];
+      const lerpX1 = lerp(a, a1, sx); const lerpX2 = lerp(a2, a3, sx);
+      return lerp(lerpX1, lerpX2, sz);
+    }
+    function sampleNormal(x,z){ const eps=1.0; const hL = sampleHeight(x-eps,z); const hR = sampleHeight(x+eps,z); const hD = sampleHeight(x,z-eps); const hU = sampleHeight(x,z+eps); const nx = hL-hR; const ny = 2.0; const nz = hD-hU; const v = new THREE.Vector3(nx,ny,nz).normalize(); return v; }
+
+    // physics update
+    let last = performance.now();
+    function step(){
+      const now = performance.now(); let dt = Math.min(0.05, (now-last)/1000); last = now;
+
+      // input
+      let throttle = 0; if(keys.w) throttle = 1; if(keys.s) throttle = -0.6;
+      const steerInput = (keys.a?1:0) - (keys.d?1:0);
+
+      // local forward vector
+      const forward = new THREE.Vector3(Math.sin(state.rotY),0,Math.cos(state.rotY));
+      // engine force
+      const driveForce = forward.clone().multiplyScalar(params.engineForce * throttle * dt / params.mass);
+      state.vel.add(driveForce);
+
+      // braking
+      if(keys.space){ state.vel.multiplyScalar(Math.max(0, 1 - params.brakeForce*dt/10000)); }
+
+      // steering modifies angular velocity based on speed
+      const speed = state.vel.length();
+      const steerAmt = steerInput * params.maxSteer * (1 - Math.min(speed/40, 0.9));
+      state.angVel = lerp(state.angVel, steerAmt * params.steerSpeed, 4*dt);
+      state.rotY += state.angVel * dt;
+
+      // gravity and suspension-like ground force
+      const pos = state.pos;
+      const terrainY = sampleHeight(pos.x, pos.z);
+      const normal = sampleNormal(pos.x, pos.z);
+
+      // push car up if below terrain
+      const desiredY = terrainY + 0.8;
+      const dy = desiredY - pos.y;
+      if(dy > 0){ // intersecting ground
+        state.vel.y += dy*8*dt; // quick correction
+      } else {
+        state.vel.y += params.gravity * dt;
+      }
+
+      // project velocity onto tangent to follow slopes
+      const vel = state.vel.clone();
+      // remove component into normal
+      const into = normal.clone().multiplyScalar(vel.dot(normal));
+      vel.sub(into);
+      state.vel.copy(vel);
+
+      // lateral friction
+      // build right vector
+      const right = new THREE.Vector3(Math.cos(state.rotY),0,-Math.sin(state.rotY));
+      const lateral = right.multiplyScalar(state.vel.dot(right));
+      lateral.multiplyScalar(1 - Math.min(params.friction*dt, 0.9));
+      // forward projection
+      const fwd = forward.multiplyScalar(state.vel.dot(forward) * 0.99);
+      state.vel.x = lateral.x + fwd.x;
+      state.vel.z = lateral.z + fwd.z;
+
+      // integrate
+      state.pos.addScaledVector(state.vel, dt);
+
+      // keep above terrain
+      const newTerrainY = sampleHeight(state.pos.x, state.pos.z);
+      const minY = newTerrainY + 0.8;
+      if(state.pos.y < minY) state.pos.y = minY;
+
+      // update render car
+      car.position.copy(state.pos);
+      car.position.y = state.pos.y;
+      car.rotation.y = state.rotY;
+
+      // animate wheels rotation
+      const wheelSpin = state.vel.length()*0.8;
+      wheels.forEach((w, i)=>{ w.rotateX(wheelSpin*dt); });
+
+      // camera
+      const camTarget = state.pos.clone().add(new THREE.Vector3(0,1.2,0));
+      const camPos = state.pos.clone().add(new THREE.Vector3(Math.sin(state.rotY)*6,3,Math.cos(state.rotY)*6));
+      camera.position.lerp(camPos, 0.06);
+      camera.lookAt(camTarget);
+
+      speedText.textContent = Math.round(state.vel.length()*3.6);
+    }
+
+    // render loop
+    function animate(){ requestAnimationFrame(animate); step(); renderer.render(scene, camera); }
+    requestAnimationFrame(()=>{ last = performance.now(); animate(); });
+
+    // Simple helpful message if something fails
+    console.log('Arcade car demo ready. Open this file in Chrome.');
+  </script>
+</body>
+</html>
